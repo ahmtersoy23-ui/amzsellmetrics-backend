@@ -434,27 +434,28 @@ router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
     const { transactions } = req.body;
 
     // Marketplace timezone offsets (in hours from UTC)
-    // Amazon reports transactions in the marketplace's local timezone
+    // Using standard time (no DST) for simplicity
+    // Note: May be off by 1 hour during DST periods (~6 months/year)
     const MARKETPLACE_TIMEZONES: Record<string, number> = {
-      'US': -5,   // US Eastern (Amazon uses EST year-round)
-      'CA': -5,   // Canada Eastern
-      'MX': -6,   // Mexico Central
-      'UK': 0,    // UTC/GMT
-      'DE': 1,    // CET
+      'US': -8,   // PST (Pacific Standard Time)
+      'CA': -8,   // PST (Canada Pacific)
+      'MX': -6,   // CST (Central Standard Time)
+      'UK': 0,    // GMT (Greenwich Mean Time)
+      'DE': 1,    // CET (Central European Time)
       'FR': 1,    // CET
       'IT': 1,    // CET
       'ES': 1,    // CET
       'NL': 1,    // CET
       'PL': 1,    // CET
       'SE': 1,    // CET
-      'AU': 10,   // AEST
-      'AE': 4,    // GST
-      'SA': 3,    // AST
-      'SG': 8,    // SGT
-      'TR': 3,    // TRT
-      'BR': -3,   // BRT
-      'JP': 9,    // JST
-      'IN': 5.5,  // IST
+      'AU': 10,   // AEST (Australian Eastern Standard)
+      'AE': 4,    // GST (Gulf Standard Time)
+      'SA': 3,    // AST (Arabia Standard Time)
+      'SG': 8,    // SGT (Singapore Time)
+      'TR': 3,    // TRT (Turkey Time)
+      'BR': -3,   // BRT (Brasilia Time)
+      'JP': 9,    // JST (Japan Standard Time)
+      'IN': 5.5,  // IST (India Standard Time)
     };
 
     // Helper function to convert UTC date to marketplace's local date
