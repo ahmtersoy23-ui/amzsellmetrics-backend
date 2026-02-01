@@ -487,26 +487,17 @@ router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
         let paramIndex = 1;
 
         for (const t of batch) {
-          // Handle empty dateOnly - calculate based on marketplace timezone
-          let dateOnly = t.dateOnly;
-          if (!dateOnly || dateOnly === '') {
-            if (t.date) {
-              const dateStr = String(t.date);
-              const match = dateStr.match(/^(\d{4}-\d{2}-\d{2})/);
-              if (match) {
-                dateOnly = match[1];
-              } else {
-                try {
-                  const d = new Date(t.date);
-                  if (!isNaN(d.getTime())) {
-                    // FIX: Use marketplace timezone instead of UTC
-                    dateOnly = getDateOnlyInMarketplaceTimezone(d, t.marketplaceCode || 'US');
-                  }
-                } catch {
-                  dateOnly = null;
-                }
+          // ALWAYS calculate dateOnly from UTC timestamp using marketplace timezone
+          // Never trust the dateOnly from Excel as it doesn't account for timezone
+          let dateOnly = null;
+          if (t.date) {
+            try {
+              const d = new Date(t.date);
+              if (!isNaN(d.getTime())) {
+                // Convert UTC timestamp to marketplace's local date
+                dateOnly = getDateOnlyInMarketplaceTimezone(d, t.marketplaceCode || 'US');
               }
-            } else {
+            } catch {
               dateOnly = null;
             }
           }
