@@ -1,0 +1,425 @@
+import { Router } from 'express';
+import { query, queryOne } from '../db';
+
+const router = Router();
+
+// ============================================
+// STATIC ROUTES (must come before /:id)
+// ============================================
+
+// Get all products with cost profile info and effective values
+router.get('/', async (req, res) => {
+  try {
+    const products = await query(`
+      SELECT p.*,
+        cp.name as cost_profile_name,
+        -- Effective values: profile first, then product
+        COALESCE(cp.base_cost, p.base_cost) as effective_base_cost,
+        COALESCE(cp.weight, p.weight) as effective_weight,
+        COALESCE(cp.width, p.width) as effective_width,
+        COALESCE(cp.height, p.height) as effective_height,
+        COALESCE(cp.length, p.length) as effective_length,
+        -- Source indicator: where did the value come from?
+        CASE WHEN cp.base_cost IS NOT NULL THEN 'profile' WHEN p.base_cost IS NOT NULL THEN 'product' ELSE NULL END as cost_source
+      FROM products p
+      LEFT JOIN cost_profiles cp ON p.cost_profile_id = cp.id
+      ORDER BY p.updated_at DESC
+    `);
+    res.json({ success: true, data: products });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get database stats
+router.get('/stats/summary', async (req, res) => {
+  try {
+    const stats = await queryOne(`
+      SELECT
+        COUNT(*) as total_products,
+        COUNT(DISTINCT category) as categories_count,
+        MAX(updated_at) as last_updated
+      FROM products
+    `);
+    res.json({ success: true, data: stats });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Bulk import products - optimized batch insert
+router.post('/bulk', async (req, res) => {
+  try {
+    const { products } = req.body;
+    if (!Array.isArray(products)) {
+      return res.status(400).json({ success: false, error: 'Products must be an array' });
+    }
+
+    if (products.length === 0) {
+      return res.json({ success: true, data: { added: 0, updated: 0 } });
+    }
+
+    // Deduplicate products by name (keep last occurrence)
+    const productMap = new Map<string, any>();
+    for (const p of products) {
+      const key = (p.name || '').toLowerCase().trim();
+      if (key) {
+        productMap.set(key, p);
+      }
+    }
+    const uniqueProducts = Array.from(productMap.values());
+
+    // Process in batches of 500 for optimal performance
+    const BATCH_SIZE = 500;
+    let totalAdded = 0;
+    let totalUpdated = 0;
+
+    for (let i = 0; i < uniqueProducts.length; i += BATCH_SIZE) {
+      const batch = uniqueProducts.slice(i, i + BATCH_SIZE);
+
+      // Build batch insert query with UNNEST for efficiency
+      const names = batch.map(p => p.name);
+      const categories = batch.map(p => p.category);
+      const baseCosts = batch.map(p => p.base_cost ?? null);
+      const sizes = batch.map(p => p.size ?? null);
+      const weights = batch.map(p => p.weight ?? null);
+      const widths = batch.map(p => p.width ?? null);
+      const heights = batch.map(p => p.height ?? null);
+      const lengths = batch.map(p => p.length ?? null);
+      const sources = batch.map(p => p.source || 'csv');
+      const productSkus = batch.map(p => p.product_sku ?? null);
+
+      const result = await query(`
+        INSERT INTO products (name, category, base_cost, size, weight, width, height, length, source, product_sku)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::text[], $10::text[])
+        ON CONFLICT (name) DO UPDATE SET
+          category = EXCLUDED.category,
+          base_cost = COALESCE(EXCLUDED.base_cost, products.base_cost),
+          size = COALESCE(EXCLUDED.size, products.size),
+          weight = COALESCE(EXCLUDED.weight, products.weight),
+          width = COALESCE(EXCLUDED.width, products.width),
+          height = COALESCE(EXCLUDED.height, products.height),
+          length = COALESCE(EXCLUDED.length, products.length),
+          product_sku = COALESCE(EXCLUDED.product_sku, products.product_sku),
+          updated_at = NOW()
+        RETURNING (xmax = 0) as is_insert
+      `, [names, categories, baseCosts, sizes, weights, widths, heights, lengths, sources, productSkus]);
+
+      // Count inserts vs updates
+      const inserted = result.filter((r: any) => r.is_insert).length;
+      totalAdded += inserted;
+      totalUpdated += result.length - inserted;
+    }
+
+    res.status(201).json({
+      success: true,
+      data: { added: totalAdded, updated: totalUpdated }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// === Category Expenses ===
+
+// Get all category expenses or filter by platform
+router.get('/category-expenses', async (req, res) => {
+  try {
+    const { platform, marketplaceCode } = req.query;
+    let sql = 'SELECT * FROM category_expenses WHERE 1=1';
+    const params: any[] = [];
+    let idx = 1;
+
+    if (platform) {
+      sql += ` AND platform = $${idx++}`;
+      params.push(platform);
+    }
+    if (marketplaceCode) {
+      sql += ` AND marketplace_code = $${idx++}`;
+      params.push(marketplaceCode);
+    }
+
+    const expenses = await query(sql, params);
+    res.json({ success: true, data: expenses });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Find specific category expense
+router.get('/category-expenses/find', async (req, res) => {
+  try {
+    const { category, platform, marketplaceCode } = req.query;
+    const expense = await queryOne(
+      'SELECT * FROM category_expenses WHERE category = $1 AND platform = $2 AND marketplace_code = $3',
+      [category, platform, marketplaceCode]
+    );
+    res.json({ success: true, data: expense });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Upsert category expense
+router.post('/category-expenses', async (req, res) => {
+  try {
+    const expense = req.body;
+    const result = await queryOne(`
+      INSERT INTO category_expenses (
+        category, platform, marketplace_code,
+        selling_fee_percent, fba_fee_percent, refund_loss_percent, vat_percent,
+        ads_percent, fba_cost_percent, fbm_cost_percent,
+        shipping_cost_percent, customs_duty_percent, warehouse_cost_percent,
+        sample_size, period_start, period_end, data_source
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+      ON CONFLICT (category, platform, marketplace_code) DO UPDATE SET
+        selling_fee_percent = EXCLUDED.selling_fee_percent,
+        fba_fee_percent = EXCLUDED.fba_fee_percent,
+        refund_loss_percent = EXCLUDED.refund_loss_percent,
+        vat_percent = EXCLUDED.vat_percent,
+        ads_percent = EXCLUDED.ads_percent,
+        fba_cost_percent = EXCLUDED.fba_cost_percent,
+        fbm_cost_percent = EXCLUDED.fbm_cost_percent,
+        shipping_cost_percent = EXCLUDED.shipping_cost_percent,
+        customs_duty_percent = EXCLUDED.customs_duty_percent,
+        warehouse_cost_percent = EXCLUDED.warehouse_cost_percent,
+        sample_size = EXCLUDED.sample_size,
+        period_start = EXCLUDED.period_start,
+        period_end = EXCLUDED.period_end,
+        data_source = EXCLUDED.data_source,
+        updated_at = NOW()
+      RETURNING *
+    `, [
+      expense.category, expense.platform, expense.marketplace_code,
+      expense.selling_fee_percent, expense.fba_fee_percent, expense.refund_loss_percent, expense.vat_percent,
+      expense.ads_percent, expense.fba_cost_percent, expense.fbm_cost_percent,
+      expense.shipping_cost_percent, expense.customs_duty_percent, expense.warehouse_cost_percent,
+      expense.sample_size, expense.period_start, expense.period_end, expense.data_source || 'manual'
+    ]);
+    res.json({ success: true, data: result });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// DYNAMIC ROUTES (/:id must be last)
+// ============================================
+
+// Get product by ID with cost profile and effective values
+router.get('/:id', async (req, res) => {
+  try {
+    const product = await queryOne(`
+      SELECT p.*,
+        cp.name as cost_profile_name,
+        -- Effective values: profile first, then product
+        COALESCE(cp.base_cost, p.base_cost) as effective_base_cost,
+        COALESCE(cp.weight, p.weight) as effective_weight,
+        COALESCE(cp.width, p.width) as effective_width,
+        COALESCE(cp.height, p.height) as effective_height,
+        COALESCE(cp.length, p.length) as effective_length,
+        -- Source indicator
+        CASE WHEN cp.base_cost IS NOT NULL THEN 'profile' WHEN p.base_cost IS NOT NULL THEN 'product' ELSE NULL END as cost_source
+      FROM products p
+      LEFT JOIN cost_profiles cp ON p.cost_profile_id = cp.id
+      WHERE p.id = $1
+    `, [req.params.id]);
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+    res.json({ success: true, data: product });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Create product
+router.post('/', async (req, res) => {
+  try {
+    const { name, category, base_cost, size, weight, width, height, length, cost_profile_id, source, product_sku } = req.body;
+    const product = await queryOne(`
+      INSERT INTO products (name, category, base_cost, size, weight, width, height, length, cost_profile_id, source, product_sku)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+      RETURNING *
+    `, [name, category, base_cost, size, weight, width, height, length, cost_profile_id, source || 'manual', product_sku]);
+    res.status(201).json({ success: true, data: product });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Update product
+router.put('/:id', async (req, res) => {
+  try {
+    const { name, category, base_cost, size, weight, width, height, length, cost_profile_id, product_sku } = req.body;
+    const product = await queryOne(`
+      UPDATE products
+      SET name = $1, category = $2, base_cost = $3, size = $4,
+          weight = $5, width = $6, height = $7, length = $8, cost_profile_id = $9, product_sku = $10,
+          updated_at = NOW()
+      WHERE id = $11
+      RETURNING *
+    `, [name, category, base_cost, size, weight, width, height, length, cost_profile_id, product_sku, req.params.id]);
+    if (!product) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+    res.json({ success: true, data: product });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Delete product
+router.delete('/:id', async (req, res) => {
+  try {
+    const result = await queryOne(
+      'DELETE FROM products WHERE id = $1 RETURNING id',
+      [req.params.id]
+    );
+    if (!result) {
+      return res.status(404).json({ success: false, error: 'Product not found' });
+    }
+    res.json({ success: true, message: 'Product deleted' });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// AMAZON ANALYZER MAPPING ENDPOINT
+// ============================================
+
+/**
+ * GET /mapping/amazon-analyzer
+ * Returns all SKU mappings with product info for Amazon Analyzer enrichment
+ * Response format optimized for fast SKU lookups by marketplace
+ */
+router.get("/mapping/amazon-analyzer", async (req, res) => {
+  try {
+    console.log("[mapping/amazon-analyzer] Fetching SKU mappings...");
+
+    // Get all SKU mappings with product info
+    const mappings = await query(`
+      SELECT
+        sm.sku,
+        sm.asin,
+        sm.marketplace_code as marketplace,
+        sm.custom_shipping,
+        sm.fbm_source,
+        p.name,
+        p.category,
+        p.base_cost as cost,
+        p.size,
+        p.default_custom_shipping,
+        p.default_fbm_source,
+        p.product_sku as parent
+      FROM sku_mappings sm
+      JOIN products p ON sm.product_id = p.id
+      WHERE sm.platform = 'amazon'
+      ORDER BY sm.marketplace_code, sm.sku
+    `);
+
+    // Transform data
+    const data = mappings.map((m: any) => ({
+      sku: m.sku,
+      asin: m.asin || "",
+      name: m.name || "",
+      parent: m.parent || m.name || "",
+      category: m.category || "",
+      cost: m.cost,
+      size: m.size,
+      marketplace: m.marketplace || "",
+      customShipping: m.custom_shipping ?? m.default_custom_shipping ?? null,
+      fbmSource: m.fbm_source || m.default_fbm_source || null,
+    }));
+
+    const withCost = data.filter((d: any) => d.cost !== null).length;
+    const withSize = data.filter((d: any) => d.size !== null).length;
+
+    console.log(`[mapping/amazon-analyzer] Returning ${data.length} mappings (${withCost} with cost, ${withSize} with size)`);
+
+    res.json({
+      success: true,
+      data,
+      meta: {
+        total: data.length,
+        withCost,
+        withSize,
+        timestamp: new Date().toISOString(),
+      },
+    });
+  } catch (error: any) {
+    console.error("[mapping/amazon-analyzer] Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /mapping/amazon-analyzer/missing
+ * Receive list of missing SKUs from Amazon Analyzer
+ */
+router.post("/mapping/amazon-analyzer/missing", async (req, res) => {
+  try {
+    const { skus } = req.body;
+    if (!Array.isArray(skus)) {
+      return res.status(400).json({ success: false, error: "skus must be an array" });
+    }
+
+    console.log(`[mapping/amazon-analyzer/missing] Received ${skus.length} missing SKUs`);
+
+    let added = 0;
+    let skipped = 0;
+
+    for (const skuInfo of skus) {
+      const { sku, asin, name, marketplace, category } = skuInfo;
+      if (!sku || !marketplace) {
+        skipped++;
+        continue;
+      }
+
+      // Check if product exists by name
+      let product = await queryOne(
+        "SELECT id FROM products WHERE name = $1",
+        [name || sku]
+      );
+
+      // Create product if not exists
+      if (!product) {
+        product = await queryOne(`
+          INSERT INTO products (name, category, source)
+          VALUES ($1, $2, 'amazon-analyzer-import')
+          RETURNING id
+        `, [name || sku, category || "Unknown"]);
+      }
+
+      // Check if mapping already exists
+      const existing = await queryOne(`
+        SELECT id FROM sku_mappings
+        WHERE platform = 'amazon' AND marketplace_code = $1 AND sku = $2
+      `, [marketplace, sku]);
+
+      if (!existing) {
+        await query(`
+          INSERT INTO sku_mappings (product_id, platform, marketplace_code, sku, asin)
+          VALUES ($1, 'amazon', $2, $3, $4)
+        `, [product.id, marketplace, sku, asin || null]);
+        added++;
+      } else {
+        skipped++;
+      }
+    }
+
+    console.log(`[mapping/amazon-analyzer/missing] Added ${added}, skipped ${skipped}`);
+
+    res.json({
+      success: true,
+      data: { added, skipped, total: skus.length },
+    });
+  } catch (error: any) {
+    console.error("[mapping/amazon-analyzer/missing] Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+export default router;

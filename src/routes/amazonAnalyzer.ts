@@ -1,0 +1,730 @@
+import { Router } from 'express';
+import { query, queryOne } from '../db';
+import { authenticateSSO } from '../middleware/sso';
+
+const router = Router();
+
+// ============================================
+// SIMPLE IN-MEMORY CACHE
+// ============================================
+interface CacheEntry<T> {
+  data: T;
+  expiry: number;
+}
+
+const cache = new Map<string, CacheEntry<any>>();
+
+function getCached<T>(key: string): T | null {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiry) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.data;
+}
+
+function setCache<T>(key: string, data: T, ttlMs: number = 5 * 60 * 1000): void {
+  cache.set(key, { data, expiry: Date.now() + ttlMs });
+}
+
+/**
+ * GET /api/amazon-analyzer/settings/shipping-rates
+ * Returns shipping rates in the format expected by amazon-analyzer frontend
+ * Cached for 5 minutes
+ */
+router.get('/settings/shipping-rates', async (req, res) => {
+  try {
+    // Check cache first
+    const cached = getCached<any>('shipping-rates');
+    if (cached) {
+      console.log('[shipping-rates] Returning cached data');
+      return res.json(cached);
+    }
+
+    console.log('[shipping-rates] Fetching shipping rates for amazon-analyzer...');
+
+    // Get all carrier rates with route info
+    const rates = await query(`
+      SELECT
+        crr.*,
+        sr.from_country,
+        sr.to_country,
+        sr.from_country || '-' || sr.to_country as route_code
+      FROM carrier_route_rates crr
+      JOIN shipping_routes sr ON crr.route_id = sr.id
+    `);
+
+    // Transform to expected format: { routes: { 'US-TR': { currency, rates: [...] } } }
+    const routes: Record<string, { currency: string; rates: Array<{ maxWeight: number; rate: number }> }> = {};
+
+    for (const rate of rates) {
+      const routeCode = rate.route_code;
+      const brackets = rate.weight_brackets;
+
+      let ratesArray: Array<{ maxWeight: number; rate: number }> = [];
+
+      if (brackets && typeof brackets === 'object') {
+        ratesArray = Object.entries(brackets)
+          .map(([weight, rateValue]) => ({
+            maxWeight: parseFloat(weight),
+            rate: parseFloat(String(rateValue)),
+          }))
+          .sort((a, b) => a.maxWeight - b.maxWeight);
+      }
+
+      if (!routes[routeCode] || ratesArray.length > (routes[routeCode].rates?.length || 0)) {
+        routes[routeCode] = {
+          currency: rate.currency || 'USD',
+          rates: ratesArray,
+        };
+      }
+    }
+
+    // Add route aliases for backward compatibility
+    const routeAliases: Record<string, string> = {
+      'US-TR': 'TR-US',
+    };
+    for (const [original, alias] of Object.entries(routeAliases)) {
+      if (routes[original] && !routes[alias]) {
+        routes[alias] = routes[original];
+      }
+    }
+
+    const response = {
+      success: true,
+      data: {
+        lastUpdated: new Date().toISOString(),
+        routes,
+      },
+    };
+
+    // Cache for 5 minutes
+    setCache('shipping-rates', response, 5 * 60 * 1000);
+
+    console.log(`[shipping-rates] Returning ${Object.keys(routes).length} routes (cached)`);
+    res.json(response);
+  } catch (error: any) {
+    console.error('[shipping-rates] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/amazon-analyzer/settings/country-configs
+ * Returns country profit configurations from marketplace_profit_configs table
+ * Cached for 5 minutes
+ */
+router.get('/settings/country-configs', async (req, res) => {
+  try {
+    // Check cache first
+    const cached = getCached<any>('country-configs');
+    if (cached) {
+      console.log('[country-configs] Returning cached data');
+      return res.json(cached);
+    }
+
+    console.log('[country-configs] Fetching marketplace profit configs...');
+
+    const configs_result = await query(`
+      SELECT
+        marketplace_code,
+        marketplace_name,
+        currency,
+        fba_config,
+        fbm_config,
+        gst_config
+      FROM marketplace_profit_configs
+      WHERE is_active = true
+    `);
+
+    const configs: Record<string, any> = {};
+    for (const cfg of configs_result) {
+      configs[cfg.marketplace_code] = {
+        name: cfg.marketplace_name,
+        currency: cfg.currency,
+        fba: cfg.fba_config || {},
+        fbm: cfg.fbm_config || {},
+        gst: cfg.gst_config || null,
+      };
+    }
+
+    const response = {
+      success: true,
+      data: { configs },
+    };
+
+    // Cache for 5 minutes
+    setCache('country-configs', response, 5 * 60 * 1000);
+
+    console.log(`[country-configs] Returning configs for ${Object.keys(configs).length} marketplaces (cached)`);
+    res.json(response);
+  } catch (error: any) {
+    console.error('[country-configs] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// FBM Override Endpoints
+// ============================================
+
+/**
+ * GET /api/amazon-analyzer/fbm-overrides
+ * Returns all FBM overrides (shipping cost and ship-from country)
+ */
+router.get('/fbm-overrides', async (req, res) => {
+  try {
+    console.log('[fbm-overrides] Fetching all FBM overrides...');
+
+    const overrides = await query(`
+      SELECT sku, marketplace, shipping_cost, ship_from_country, updated_at
+      FROM amz_fbm_overrides
+      ORDER BY updated_at DESC
+    `);
+
+    console.log(`[fbm-overrides] Returning ${overrides.length} overrides`);
+
+    res.json({
+      success: true,
+      data: overrides,
+    });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/amazon-analyzer/fbm-overrides
+ * Create or update FBM override for a SKU
+ */
+router.post('/fbm-overrides', authenticateSSO, async (req, res) => {
+  try {
+    const { sku, marketplace, shippingCost, shipFromCountry } = req.body;
+
+    if (!sku || !marketplace) {
+      return res.status(400).json({ success: false, error: 'sku and marketplace are required' });
+    }
+
+    console.log(`[fbm-overrides] Upserting override for ${sku} in ${marketplace}`);
+
+    const result = await queryOne(`
+      INSERT INTO amz_fbm_overrides (sku, marketplace, shipping_cost, ship_from_country, updated_at)
+      VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+      ON CONFLICT (sku, marketplace)
+      DO UPDATE SET
+        shipping_cost = COALESCE($3, amz_fbm_overrides.shipping_cost),
+        ship_from_country = COALESCE($4, amz_fbm_overrides.ship_from_country),
+        updated_at = CURRENT_TIMESTAMP
+      RETURNING *
+    `, [sku, marketplace, shippingCost || null, shipFromCountry || null]);
+
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/amazon-analyzer/fbm-overrides/bulk
+ * Bulk upsert FBM overrides
+ */
+router.post('/fbm-overrides/bulk', authenticateSSO, async (req, res) => {
+  try {
+    const { overrides } = req.body;
+
+    if (!overrides || !Array.isArray(overrides)) {
+        // Limit array size    if (overrides.length === 0) {      return res.status(400).json({ success: false, error: 'No overrides provided' });    }    if (overrides.length > 1000) {      return res.status(400).json({        success: false,        error: 'Too many overrides. Maximum 1,000 per request.'      });    }
+      return res.status(400).json({ success: false, error: 'overrides array is required' });
+    }
+
+    console.log(`[fbm-overrides] Bulk upserting ${overrides.length} overrides`);
+
+    let successCount = 0;
+    for (const override of overrides) {
+      const { sku, marketplace, shippingCost, shipFromCountry } = override;
+      if (!sku || !marketplace) continue;
+
+      await query(`
+        INSERT INTO amz_fbm_overrides (sku, marketplace, shipping_cost, ship_from_country, updated_at)
+        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+        ON CONFLICT (sku, marketplace)
+        DO UPDATE SET
+          shipping_cost = COALESCE($3, amz_fbm_overrides.shipping_cost),
+          ship_from_country = COALESCE($4, amz_fbm_overrides.ship_from_country),
+          updated_at = CURRENT_TIMESTAMP
+      `, [sku, marketplace, shippingCost || null, shipFromCountry || null]);
+      successCount++;
+    }
+
+    console.log(`[fbm-overrides] Bulk upserted ${successCount} overrides`);
+
+    res.json({
+      success: true,
+      count: successCount,
+    });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/amazon-analyzer/fbm-overrides/:sku/:marketplace
+ */
+router.delete('/fbm-overrides/:sku/:marketplace', authenticateSSO, async (req, res) => {
+  try {
+    const { sku, marketplace } = req.params;
+
+    await query(`DELETE FROM amz_fbm_overrides WHERE sku = $1 AND marketplace = $2`, [sku, marketplace]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/amazon-analyzer/fbm-overrides/clear-shipping/:sku/:marketplace
+ */
+router.delete('/fbm-overrides/clear-shipping/:sku/:marketplace', authenticateSSO, async (req, res) => {
+  try {
+    const { sku, marketplace } = req.params;
+
+    await query(`
+      UPDATE amz_fbm_overrides
+      SET shipping_cost = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE sku = $1 AND marketplace = $2
+    `, [sku, marketplace]);
+
+    await query(`
+      DELETE FROM amz_fbm_overrides
+      WHERE sku = $1 AND marketplace = $2
+        AND shipping_cost IS NULL AND ship_from_country IS NULL
+    `, [sku, marketplace]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/amazon-analyzer/fbm-overrides/clear-location/:sku/:marketplace
+ */
+router.delete('/fbm-overrides/clear-location/:sku/:marketplace', authenticateSSO, async (req, res) => {
+  try {
+    const { sku, marketplace } = req.params;
+
+    await query(`
+      UPDATE amz_fbm_overrides
+      SET ship_from_country = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE sku = $1 AND marketplace = $2
+    `, [sku, marketplace]);
+
+    await query(`
+      DELETE FROM amz_fbm_overrides
+      WHERE sku = $1 AND marketplace = $2
+        AND shipping_cost IS NULL AND ship_from_country IS NULL
+    `, [sku, marketplace]);
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[fbm-overrides] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ============================================
+// Transaction Storage Endpoints
+// ============================================
+
+/**
+ * GET /api/amazon-analyzer/transactions
+ */
+router.get('/transactions', async (req, res) => {
+  try {
+    const { startDate, endDate, marketplace, limit = 50000, offset = 0 } = req.query;
+
+    console.log('[transactions] Fetching transactions...');
+
+    let whereClause = 'WHERE 1=1';
+    const params: any[] = [];
+    let paramIndex = 1;
+
+    if (startDate) {
+      whereClause += ` AND date_only >= $${paramIndex++}`;
+      params.push(startDate);
+    }
+    if (endDate) {
+      whereClause += ` AND date_only <= $${paramIndex++}`;
+      params.push(endDate);
+    }
+    if (marketplace) {
+      whereClause += ` AND marketplace_code = $${paramIndex++}`;
+      params.push(marketplace);
+    }
+
+    const countResult = await queryOne(`SELECT COUNT(*) as total FROM amz_transactions ${whereClause}`, params);
+
+    params.push(parseInt(String(limit)));
+    params.push(parseInt(String(offset)));
+
+    const transactions = await query(`
+      SELECT
+        transaction_id as "id",
+        file_name as "fileName",
+        transaction_date as "date",
+        date_only as "dateOnly",
+        type,
+        category_type as "categoryType",
+        order_id as "orderId",
+        sku,
+        description,
+        marketplace,
+        fulfillment,
+        order_postal as "orderPostal",
+        quantity,
+        product_sales as "productSales",
+        promotional_rebates as "promotionalRebates",
+        selling_fees as "sellingFees",
+        fba_fees as "fbaFees",
+        other_transaction_fees as "otherTransactionFees",
+        other,
+        vat,
+        liquidations,
+        total,
+        marketplace_code as "marketplaceCode"
+      FROM amz_transactions
+      ${whereClause}
+      ORDER BY date_only DESC, transaction_id
+      LIMIT $${paramIndex++} OFFSET $${paramIndex++}
+    `, params);
+
+    console.log(`[transactions] Returning ${transactions.length} of ${countResult?.total || 0} transactions`);
+
+    res.json({
+      success: true,
+      data: transactions,
+      meta: {
+        total: parseInt(countResult?.total || '0'),
+        limit: parseInt(String(limit)),
+        offset: parseInt(String(offset)),
+      },
+    });
+  } catch (error: any) {
+    console.error('[transactions] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/amazon-analyzer/transactions/bulk
+ * Optimized bulk insert using multi-row VALUES
+ */
+router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
+  try {
+    const { transactions } = req.body;
+
+    // Marketplace timezone offsets (in hours from UTC)
+    // Amazon reports transactions in the marketplace's local timezone
+    const MARKETPLACE_TIMEZONES: Record<string, number> = {
+      'US': -5,   // US Eastern (Amazon uses EST year-round)
+      'CA': -5,   // Canada Eastern
+      'MX': -6,   // Mexico Central
+      'UK': 0,    // UTC/GMT
+      'DE': 1,    // CET
+      'FR': 1,    // CET
+      'IT': 1,    // CET
+      'ES': 1,    // CET
+      'NL': 1,    // CET
+      'PL': 1,    // CET
+      'SE': 1,    // CET
+      'AU': 10,   // AEST
+      'AE': 4,    // GST
+      'SA': 3,    // AST
+      'SG': 8,    // SGT
+      'TR': 3,    // TRT
+      'BR': -3,   // BRT
+      'JP': 9,    // JST
+      'IN': 5.5,  // IST
+    };
+
+    // Helper function to convert UTC date to marketplace's local date
+    function getDateOnlyInMarketplaceTimezone(utcDate: Date, marketplaceCode: string): string {
+      const offset = MARKETPLACE_TIMEZONES[marketplaceCode] || 0;
+      const localDate = new Date(utcDate.getTime() + offset * 60 * 60 * 1000);
+      return localDate.toISOString().split('T')[0];
+    }
+
+    if (!transactions || !Array.isArray(transactions)) {
+        // Limit array size to prevent DoS    if (transactions.length === 0) {      return res.status(400).json({ success: false, error: 'No transactions provided' });    }    if (transactions.length > 10000) {      return res.status(400).json({        success: false,        error: 'Too many transactions. Maximum 10,000 per request. Please split into multiple requests.'      });    }
+      return res.status(400).json({ success: false, error: 'transactions array is required' });
+    }
+
+    console.log(`[transactions] Bulk upserting ${transactions.length} transactions...`);
+
+    let insertedCount = 0;
+    let updatedCount = 0;
+    let errorCount = 0;
+
+    // Process in batches of 100 for multi-row insert
+    const batchSize = 100;
+    for (let i = 0; i < transactions.length; i += batchSize) {
+      const batch = transactions.slice(i, i + batchSize);
+
+      try {
+        // Build multi-row VALUES clause
+        const values: any[] = [];
+        const placeholders: string[] = [];
+        let paramIndex = 1;
+
+        for (const t of batch) {
+          // Handle empty dateOnly - calculate based on marketplace timezone
+          let dateOnly = t.dateOnly;
+          if (!dateOnly || dateOnly === '') {
+            if (t.date) {
+              const dateStr = String(t.date);
+              const match = dateStr.match(/^(\d{4}-\d{2}-\d{2})/);
+              if (match) {
+                dateOnly = match[1];
+              } else {
+                try {
+                  const d = new Date(t.date);
+                  if (!isNaN(d.getTime())) {
+                    // FIX: Use marketplace timezone instead of UTC
+                    dateOnly = getDateOnlyInMarketplaceTimezone(d, t.marketplaceCode || 'US');
+                  }
+                } catch {
+                  dateOnly = null;
+                }
+              }
+            } else {
+              dateOnly = null;
+            }
+          }
+
+          const rowPlaceholders: string[] = [];
+          for (let j = 0; j < 23; j++) {
+            rowPlaceholders.push(`$${paramIndex++}`);
+          }
+          placeholders.push(`(${rowPlaceholders.join(', ')})`);
+
+          values.push(
+            t.id, t.fileName, t.date, dateOnly,
+            t.type, t.categoryType, t.orderId, t.sku, t.description,
+            t.marketplace, t.fulfillment, t.orderPostal, t.quantity || 0,
+            t.productSales || 0, t.promotionalRebates || 0, t.sellingFees || 0,
+            t.fbaFees || 0, t.otherTransactionFees || 0, t.other || 0, t.vat || 0,
+            t.liquidations || 0, t.total || 0, t.marketplaceCode
+          );
+        }
+
+        const result = await query(`
+          INSERT INTO amz_transactions (
+            transaction_id, file_name, transaction_date, date_only,
+            type, category_type, order_id, sku, description,
+            marketplace, fulfillment, order_postal, quantity,
+            product_sales, promotional_rebates, selling_fees,
+            fba_fees, other_transaction_fees, other, vat,
+            liquidations, total, marketplace_code
+          ) VALUES ${placeholders.join(', ')}
+          ON CONFLICT (transaction_id) DO UPDATE SET
+            file_name = EXCLUDED.file_name,
+            transaction_date = EXCLUDED.transaction_date,
+            date_only = EXCLUDED.date_only,
+            type = EXCLUDED.type,
+            category_type = EXCLUDED.category_type,
+            order_id = EXCLUDED.order_id,
+            sku = EXCLUDED.sku,
+            description = EXCLUDED.description,
+            marketplace = EXCLUDED.marketplace,
+            fulfillment = EXCLUDED.fulfillment,
+            order_postal = EXCLUDED.order_postal,
+            quantity = EXCLUDED.quantity,
+            product_sales = EXCLUDED.product_sales,
+            promotional_rebates = EXCLUDED.promotional_rebates,
+            selling_fees = EXCLUDED.selling_fees,
+            fba_fees = EXCLUDED.fba_fees,
+            other_transaction_fees = EXCLUDED.other_transaction_fees,
+            other = EXCLUDED.other,
+            vat = EXCLUDED.vat,
+            liquidations = EXCLUDED.liquidations,
+            total = EXCLUDED.total,
+            marketplace_code = EXCLUDED.marketplace_code
+          RETURNING (xmax = 0) as inserted
+        `, values);
+
+        for (const row of result) {
+          if (row.inserted) insertedCount++;
+          else updatedCount++;
+        }
+      } catch (err) {
+        errorCount += batch.length;
+        console.error(`[transactions] Batch error:`, err);
+      }
+
+      if ((i + batchSize) % 1000 === 0 || i + batchSize >= transactions.length) {
+        console.log(`[transactions] Processed ${Math.min(i + batchSize, transactions.length)} / ${transactions.length}`);
+      }
+    }
+
+    console.log(`[transactions] Complete: ${insertedCount} inserted, ${updatedCount} updated, ${errorCount} errors`);
+
+    res.json({
+      success: true,
+      data: {
+        inserted: insertedCount,
+        updated: updatedCount,
+        errors: errorCount,
+        total: transactions.length,
+      },
+    });
+  } catch (error: any) {
+    console.error('[transactions] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/amazon-analyzer/transactions/stats
+ */
+router.get('/transactions/stats', async (req, res) => {
+  try {
+    console.log('[transactions] Fetching stats...');
+
+    const stats = await queryOne(`
+      SELECT
+        COUNT(*) as total,
+        MIN(date_only) as min_date,
+        MAX(date_only) as max_date
+      FROM amz_transactions
+    `);
+
+    const byMarketplace = await query(`
+      SELECT
+        marketplace_code,
+        COUNT(*) as count,
+        MIN(date_only) as min_date,
+        MAX(date_only) as max_date
+      FROM amz_transactions
+      GROUP BY marketplace_code
+      ORDER BY count DESC
+    `);
+
+    res.json({
+      success: true,
+      data: {
+        total: parseInt(stats?.total || '0'),
+        minDate: stats?.min_date,
+        maxDate: stats?.max_date,
+        byMarketplace,
+      },
+    });
+  } catch (error: any) {
+    console.error('[transactions] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/amazon-analyzer/transactions
+ */
+router.delete('/transactions', async (req, res) => {
+  try {
+    console.log('[transactions] Deleting all transactions...');
+
+    await query('DELETE FROM amz_transactions');
+
+    res.json({ success: true });
+  } catch (error: any) {
+    console.error('[transactions] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * DELETE /api/amazon-analyzer/transactions/file/:fileName
+ */
+router.delete('/transactions/file/:fileName', async (req, res) => {
+  try {
+    const { fileName } = req.params;
+
+    console.log(`[transactions] Deleting transactions from file: ${fileName}`);
+
+    const result = await query(
+      'DELETE FROM amz_transactions WHERE file_name = $1 RETURNING transaction_id',
+      [fileName]
+    );
+
+    res.json({
+      success: true,
+      deleted: result.length,
+    });
+  } catch (error: any) {
+    console.error('[transactions] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/amazon-analyzer/sku-master
+ * Cached for 5 minutes
+ */
+router.get('/sku-master', async (req, res) => {
+  try {
+    // Check cache first
+    const cached = getCached<any>('sku-master');
+    if (cached) {
+      console.log('[sku-master] Returning cached data');
+      return res.json(cached);
+    }
+
+    console.log('[sku-master] Fetching SKU master data...');
+
+    const skus = await query(`
+      SELECT
+        sku,
+        marketplace,
+        country_code,
+        asin,
+        iwasku,
+        name,
+        parent,
+        category,
+        cost,
+        size,
+        custom_shipping,
+        fbm_source,
+        fulfillment
+      FROM sku_master
+      ORDER BY sku
+    `);
+
+    const response = {
+      success: true,
+      data: skus,
+      meta: {
+        total: skus.length,
+      },
+    };
+
+    // Cache for 5 minutes
+    setCache('sku-master', response, 5 * 60 * 1000);
+
+    console.log(`[sku-master] Returning ${skus.length} SKUs (cached)`);
+    res.json(response);
+  } catch (error: any) {
+    console.error('[sku-master] Error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+export default router;
