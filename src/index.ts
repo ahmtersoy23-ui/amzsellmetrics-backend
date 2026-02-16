@@ -17,6 +17,9 @@ import costingRouter from './routes/costing';
 import amazonAnalyzerRouter from './routes/amazonAnalyzer';
 import authRouter from './routes/auth';
 
+// Middleware
+import { authenticateSSO } from './middleware/sso';
+
 // Services
 import { startExchangeRateCron } from './services/exchangeRateCron';
 
@@ -94,22 +97,17 @@ app.use(express.json({ limit: '50mb' }));
 // All POST/PUT/DELETE requests (except auth) require admin role
 // ============================================
 app.use((req, res, next) => {
-  // Skip for GET requests (read-only)
-  if (req.method === 'GET') {
-    return next();
-  }
-
   // Skip for auth routes (login, etc.)
   if (req.path.startsWith('/api/auth')) {
     return next();
   }
 
-  // Skip for SSO-authenticated routes (amazon-analyzer uses SSO)
-  if (req.path.startsWith('/api/amazon-analyzer')) {
+  // Skip for health check
+  if (req.path === '/api/health') {
     return next();
   }
 
-  // For POST/PUT/DELETE, require admin token
+  // All other routes now require admin token (both GET and POST/PUT/DELETE)
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
 
@@ -150,15 +148,15 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// Routes - Apply stricter rate limiter to auth routes
+// Routes - Apply SSO authentication to all routes except auth
 app.use('/api/auth', authLimiter, authRouter);
-app.use('/api/products', productsRouter);
-app.use('/api/sku', skuRouter);
-app.use('/api/marketplaces', marketplacesRouter);
-app.use('/api/settings', settingsRouter);
-app.use('/api/shipping', shippingRouter);
-app.use('/api/costing', costingRouter);
-app.use('/api/amazon-analyzer', amazonAnalyzerRouter);
+app.use('/api/products', authenticateSSO, productsRouter);
+app.use('/api/sku', authenticateSSO, skuRouter);
+app.use('/api/marketplaces', authenticateSSO, marketplacesRouter);
+app.use('/api/settings', authenticateSSO, settingsRouter);
+app.use('/api/shipping', authenticateSSO, shippingRouter);
+app.use('/api/costing', authenticateSSO, costingRouter);
+app.use('/api/amazon-analyzer', authenticateSSO, amazonAnalyzerRouter);
 
 // Error handler
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
