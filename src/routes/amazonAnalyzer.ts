@@ -33,7 +33,7 @@ function setCache<T>(key: string, data: T, ttlMs: number = 5 * 60 * 1000): void 
  * Returns shipping rates in the format expected by amazon-analyzer frontend
  * Cached for 5 minutes
  */
-router.get('/settings/shipping-rates', async (req, res) => {
+router.get('/settings/shipping-rates', authenticateSSO, async (req, res) => {
   try {
     // Check cache first
     const cached = getCached<any>('shipping-rates');
@@ -115,7 +115,7 @@ router.get('/settings/shipping-rates', async (req, res) => {
  * Returns country profit configurations from marketplace_profit_configs table
  * Cached for 5 minutes
  */
-router.get('/settings/country-configs', async (req, res) => {
+router.get('/settings/country-configs', authenticateSSO, async (req, res) => {
   try {
     // Check cache first
     const cached = getCached<any>('country-configs');
@@ -173,7 +173,7 @@ router.get('/settings/country-configs', async (req, res) => {
  * GET /api/amazon-analyzer/fbm-overrides
  * Returns all FBM overrides (shipping cost and ship-from country)
  */
-router.get('/fbm-overrides', async (req, res) => {
+router.get('/fbm-overrides', authenticateSSO, async (req, res) => {
   try {
     console.log('[fbm-overrides] Fetching all FBM overrides...');
 
@@ -349,7 +349,7 @@ router.delete('/fbm-overrides/clear-location/:sku/:marketplace', authenticateSSO
 /**
  * GET /api/amazon-analyzer/transactions
  */
-router.get('/transactions', async (req, res) => {
+router.get('/transactions', authenticateSSO, async (req, res) => {
   try {
     const { startDate, endDate, marketplace, limit = 50000, offset = 0 } = req.query;
 
@@ -588,7 +588,7 @@ router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
 /**
  * GET /api/amazon-analyzer/transactions/stats
  */
-router.get('/transactions/stats', async (req, res) => {
+router.get('/transactions/stats', authenticateSSO, async (req, res) => {
   try {
     console.log('[transactions] Fetching stats...');
 
@@ -629,12 +629,18 @@ router.get('/transactions/stats', async (req, res) => {
 /**
  * DELETE /api/amazon-analyzer/transactions
  */
-router.delete('/transactions', async (req, res) => {
+router.delete('/transactions', authenticateSSO, async (req, res) => {
   try {
-    console.log('[transactions] Deleting all transactions...');
+    // Role kontrolü ekle — sadece admin silebilmeli
+    if (req.ssoUser?.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required to delete all transactions'
+      });
+    }
 
+    console.log(`[transactions] Deleting all transactions by ${req.ssoUser?.email}`);
     await query('DELETE FROM amz_transactions');
-
     res.json({ success: true });
   } catch (error: any) {
     console.error('[transactions] Error:', error);
@@ -645,21 +651,22 @@ router.delete('/transactions', async (req, res) => {
 /**
  * DELETE /api/amazon-analyzer/transactions/file/:fileName
  */
-router.delete('/transactions/file/:fileName', async (req, res) => {
+router.delete('/transactions/file/:fileName', authenticateSSO, async (req, res) => {
   try {
+    if (req.ssoUser?.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        error: 'Admin access required to delete transactions'
+      });
+    }
+
     const { fileName } = req.params;
-
-    console.log(`[transactions] Deleting transactions from file: ${fileName}`);
-
+    console.log(`[transactions] Deleting transactions from file: ${fileName} by ${req.ssoUser?.email}`);
     const result = await query(
       'DELETE FROM amz_transactions WHERE file_name = $1 RETURNING transaction_id',
       [fileName]
     );
-
-    res.json({
-      success: true,
-      deleted: result.length,
-    });
+    res.json({ success: true, deleted: result.length });
   } catch (error: any) {
     console.error('[transactions] Error:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -670,7 +677,7 @@ router.delete('/transactions/file/:fileName', async (req, res) => {
  * GET /api/amazon-analyzer/sku-master
  * Cached for 5 minutes
  */
-router.get('/sku-master', async (req, res) => {
+router.get('/sku-master', authenticateSSO, async (req, res) => {
   try {
     // Check cache first
     const cached = getCached<any>('sku-master');

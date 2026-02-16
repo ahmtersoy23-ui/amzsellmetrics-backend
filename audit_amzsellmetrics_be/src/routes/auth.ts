@@ -4,6 +4,7 @@
 
 import { Router, Request, Response, NextFunction } from 'express';
 import bcrypt from 'bcryptjs';
+import rateLimit from 'express-rate-limit';
 import jwt from 'jsonwebtoken';
 import { query } from '../db';
 
@@ -15,6 +16,49 @@ if (!JWT_SECRET) {
   throw new Error('FATAL: JWT_SECRET environment variable is required but not set');
 }
 const JWT_EXPIRES_IN = '7d'; // 7 days
+
+// ============================================
+// RATE LIMITING
+// ============================================
+
+/**
+ * Rate limiter for login endpoint
+ * - 5 attempts per 15 minutes per IP
+ * - Prevents brute force attacks
+ */
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 5, // 5 attempts
+  message: { success: false, error: 'Too many login attempts from this IP, please try again after 15 minutes' },
+  standardHeaders: true,
+  legacyHeaders: false,
+  skipSuccessfulRequests: false,
+});
+
+/**
+ * Rate limiter for general auth endpoints
+ * - 20 requests per 15 minutes
+ */
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, error: 'Too many requests from this IP, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+/**
+ * Rate limiter for password change
+ * - 3 attempts per hour
+ */
+const passwordChangeLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 3,
+  message: { success: false, error: 'Too many password change attempts, please try again after 1 hour' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 
 // ============================================
 // INPUT VALIDATION HELPERS
@@ -133,7 +177,7 @@ export const requireAdmin = (req: Request, res: Response, next: NextFunction) =>
  * POST /api/auth/login
  * Login with username and password
  */
-router.post('/login', async (req: Request, res: Response) => {
+router.post('/login', loginLimiter, async (req: Request, res: Response) => {
   try {
     const email = sanitizeString(req.body.email, 254).toLowerCase();
     const password = req.body.password;
@@ -205,7 +249,7 @@ router.post('/login', async (req: Request, res: Response) => {
  * GET /api/auth/verify
  * Verify token and return user info
  */
-router.get('/verify', authenticateToken, async (req: Request, res: Response) => {
+router.get('/verify', authLimiter, authenticateToken, async (req: Request, res: Response) => {
   try {
     const users = await query(
       'SELECT id, username, email, role, is_active FROM amzsellmetrics_users WHERE id = $1',
@@ -239,7 +283,7 @@ router.get('/verify', authenticateToken, async (req: Request, res: Response) => 
  * POST /api/auth/change-password
  * Change user's own password
  */
-router.post('/change-password', authenticateToken, async (req: Request, res: Response) => {
+router.post('/change-password', passwordChangeLimiter, authenticateToken, async (req: Request, res: Response) => {
   try {
     const { currentPassword, newPassword } = req.body;
 
@@ -291,7 +335,7 @@ router.post('/change-password', authenticateToken, async (req: Request, res: Res
  * GET /api/auth/users
  * Get all users (admin only)
  */
-router.get('/users', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+router.get('/users', authLimiter, authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const users = await query(
       'SELECT id, username, email, role, is_active, created_at, last_login FROM amzsellmetrics_users ORDER BY created_at DESC'
@@ -308,7 +352,7 @@ router.get('/users', authenticateToken, requireAdmin, async (req: Request, res: 
  * POST /api/auth/users
  * Create new user (admin only)
  */
-router.post('/users', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+router.post('/users', authLimiter, authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const email = sanitizeString(req.body.email, 254).toLowerCase();
     const password = req.body.password;
@@ -358,7 +402,7 @@ router.post('/users', authenticateToken, requireAdmin, async (req: Request, res:
  * PUT /api/auth/users/:id
  * Update user (admin only)
  */
-router.put('/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+router.put('/users/:id', authLimiter, authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const userId = parseInt(req.params.id);
 
@@ -445,7 +489,7 @@ router.put('/users/:id', authenticateToken, requireAdmin, async (req: Request, r
  * DELETE /api/auth/users/:id
  * Delete user (admin only)
  */
-router.delete('/users/:id', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+router.delete('/users/:id', authLimiter, authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
     const userId = parseInt(req.params.id);
 

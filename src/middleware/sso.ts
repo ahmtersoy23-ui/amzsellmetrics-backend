@@ -1,7 +1,11 @@
 import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 
-const JWT_SECRET = process.env.SSO_JWT_SECRET || 'IWA_Apps_SSO_JWT_Secret_Key_2026_Min_64_Chars_Required_For_Security';
+const JWT_SECRET = process.env.SSO_JWT_SECRET;
+if (!JWT_SECRET) {
+  console.error('FATAL: SSO_JWT_SECRET environment variable is required');
+  process.exit(1);
+}
 const APP_CODE = 'amzsellmetrics';
 
 interface TokenPayload {

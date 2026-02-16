@@ -88,10 +88,11 @@ router.post('/bulk', async (req, res) => {
       const lengths = batch.map(p => p.length ?? null);
       const sources = batch.map(p => p.source || 'csv');
       const productSkus = batch.map(p => p.product_sku ?? null);
+      const parents = batch.map(p => p.parent ?? null);
 
       const result = await query(`
-        INSERT INTO products (name, category, base_cost, size, weight, width, height, length, source, product_sku)
-        SELECT * FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::text[], $10::text[])
+        INSERT INTO products (name, category, base_cost, size, weight, width, height, length, source, product_sku, parent)
+        SELECT * FROM UNNEST($1::text[], $2::text[], $3::numeric[], $4::numeric[], $5::numeric[], $6::numeric[], $7::numeric[], $8::numeric[], $9::text[], $10::text[], $11::text[])
         ON CONFLICT (name) DO UPDATE SET
           category = EXCLUDED.category,
           base_cost = COALESCE(EXCLUDED.base_cost, products.base_cost),
@@ -101,9 +102,10 @@ router.post('/bulk', async (req, res) => {
           height = COALESCE(EXCLUDED.height, products.height),
           length = COALESCE(EXCLUDED.length, products.length),
           product_sku = COALESCE(EXCLUDED.product_sku, products.product_sku),
+          parent = COALESCE(EXCLUDED.parent, products.parent),
           updated_at = NOW()
         RETURNING (xmax = 0) as is_insert
-      `, [names, categories, baseCosts, sizes, weights, widths, heights, lengths, sources, productSkus]);
+      `, [names, categories, baseCosts, sizes, weights, widths, heights, lengths, sources, productSkus, parents]);
 
       // Count inserts vs updates
       const inserted = result.filter((r: any) => r.is_insert).length;
@@ -115,6 +117,21 @@ router.post('/bulk', async (req, res) => {
       success: true,
       data: { added: totalAdded, updated: totalUpdated }
     });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get distinct product categories
+router.get('/categories', async (req, res) => {
+  try {
+    const result = await query(`
+      SELECT DISTINCT category 
+      FROM products 
+      WHERE category IS NOT NULL AND category != ''
+      ORDER BY category
+    `);
+    res.json({ success: true, data: result.map((r: any) => r.category) });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
   }
@@ -292,32 +309,30 @@ router.delete('/:id', async (req, res) => {
 
 /**
  * GET /mapping/amazon-analyzer
- * Returns all SKU mappings with product info for Amazon Analyzer enrichment
- * Response format optimized for fast SKU lookups by marketplace
+ * Returns all SKU mappings from sku_master table
+ * Simplified query using the new clean structure
  */
 router.get("/mapping/amazon-analyzer", async (req, res) => {
   try {
-    console.log("[mapping/amazon-analyzer] Fetching SKU mappings...");
+    console.log("[mapping/amazon-analyzer] Fetching from sku_master...");
 
-    // Get all SKU mappings with product info
+    // Direct query from sku_master - no joins needed
     const mappings = await query(`
       SELECT
-        sm.sku,
-        sm.asin,
-        sm.marketplace_code as marketplace,
-        sm.custom_shipping,
-        sm.fbm_source,
-        p.name,
-        p.category,
-        p.base_cost as cost,
-        p.size,
-        p.default_custom_shipping,
-        p.default_fbm_source,
-        p.product_sku as parent
-      FROM sku_mappings sm
-      JOIN products p ON sm.product_id = p.id
-      WHERE sm.platform = 'amazon'
-      ORDER BY sm.marketplace_code, sm.sku
+        sku,
+        asin,
+        country_code as marketplace,
+        name,
+        parent,
+        category,
+        cost,
+        size,
+        custom_shipping,
+        fbm_source,
+        fulfillment
+      FROM sku_master
+      WHERE marketplace = 'amazon'
+      ORDER BY country_code, sku
     `);
 
     // Transform data
@@ -330,8 +345,9 @@ router.get("/mapping/amazon-analyzer", async (req, res) => {
       cost: m.cost,
       size: m.size,
       marketplace: m.marketplace || "",
-      customShipping: m.custom_shipping ?? m.default_custom_shipping ?? null,
-      fbmSource: m.fbm_source || m.default_fbm_source || null,
+      customShipping: m.custom_shipping ?? null,
+      fbmSource: m.fbm_source || null,
+      fulfillment: m.fulfillment || null,
     }));
 
     const withCost = data.filter((d: any) => d.cost !== null).length;
@@ -355,9 +371,11 @@ router.get("/mapping/amazon-analyzer", async (req, res) => {
   }
 });
 
+
 /**
  * POST /mapping/amazon-analyzer/missing
  * Receive list of missing SKUs from Amazon Analyzer
+ * Now inserts directly into sku_master table
  */
 router.post("/mapping/amazon-analyzer/missing", async (req, res) => {
   try {
@@ -372,38 +390,21 @@ router.post("/mapping/amazon-analyzer/missing", async (req, res) => {
     let skipped = 0;
 
     for (const skuInfo of skus) {
-      const { sku, asin, name, marketplace, category } = skuInfo;
+      const { sku, asin, name, marketplace, category, fulfillment } = skuInfo;
       if (!sku || !marketplace) {
         skipped++;
         continue;
       }
 
-      // Check if product exists by name
-      let product = await queryOne(
-        "SELECT id FROM products WHERE name = $1",
-        [name || sku]
-      );
+      // Insert directly into sku_master (upsert)
+      const result = await query(`
+        INSERT INTO sku_master (sku, marketplace, country_code, asin, name, category, fulfillment)
+        VALUES ($1, 'amazon', $2, $3, $4, $5, $6)
+        ON CONFLICT (sku, marketplace, country_code) DO NOTHING
+        RETURNING id
+      `, [sku, marketplace, asin || null, name || sku, category || 'Unknown', fulfillment || null]);
 
-      // Create product if not exists
-      if (!product) {
-        product = await queryOne(`
-          INSERT INTO products (name, category, source)
-          VALUES ($1, $2, 'amazon-analyzer-import')
-          RETURNING id
-        `, [name || sku, category || "Unknown"]);
-      }
-
-      // Check if mapping already exists
-      const existing = await queryOne(`
-        SELECT id FROM sku_mappings
-        WHERE platform = 'amazon' AND marketplace_code = $1 AND sku = $2
-      `, [marketplace, sku]);
-
-      if (!existing) {
-        await query(`
-          INSERT INTO sku_mappings (product_id, platform, marketplace_code, sku, asin)
-          VALUES ($1, 'amazon', $2, $3, $4)
-        `, [product.id, marketplace, sku, asin || null]);
+      if (result.length > 0) {
         added++;
       } else {
         skipped++;
@@ -418,6 +419,89 @@ router.post("/mapping/amazon-analyzer/missing", async (req, res) => {
     });
   } catch (error: any) {
     console.error("[mapping/amazon-analyzer/missing] Error:", error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /mapping/amazon-analyzer/sync
+ * Manually sync sku_master table with latest product data from marketplace_product_data + products
+ * Called from PriceLab UI after product updates
+ */
+router.post("/mapping/amazon-analyzer/sync", async (req, res) => {
+  try {
+    console.log("[mapping/amazon-analyzer/sync] Starting SKU Master sync...");
+
+    // Update existing records with latest product data
+    // parent = p.parent (ana varyasyon ürünü, product_sku/iwasku değil)
+    const updateResult = await query(`
+      UPDATE sku_master sm SET
+        name = p.name,
+        parent = COALESCE(p.parent, p.product_sku),
+        category = p.category,
+        cost = p.base_cost,
+        size = p.size,
+        custom_shipping = p.default_custom_shipping,
+        fbm_source = p.default_fbm_source,
+        updated_at = NOW()
+      FROM marketplace_product_data mpd
+      JOIN products p ON mpd.product_id = p.id
+      WHERE sm.sku = mpd.sku
+        AND sm.country_code = mpd.country_code
+        AND sm.marketplace = 'amazon'
+    `);
+
+    // Insert new records that don't exist yet
+    // parent = p.parent (ana varyasyon ürünü), fallback to product_sku if parent is null
+    const insertResult = await query(`
+      INSERT INTO sku_master (sku, marketplace, country_code, asin, iwasku, name, parent, category, cost, size, custom_shipping, fbm_source)
+      SELECT
+        mpd.sku,
+        'amazon',
+        mpd.country_code,
+        mpd.asin,
+        p.product_sku,
+        p.name,
+        COALESCE(p.parent, p.product_sku),
+        p.category,
+        p.base_cost,
+        p.size,
+        p.default_custom_shipping,
+        p.default_fbm_source
+      FROM marketplace_product_data mpd
+      JOIN products p ON mpd.product_id = p.id
+      WHERE mpd.sku IS NOT NULL AND mpd.sku != ''
+      ON CONFLICT (sku, marketplace, country_code) DO NOTHING
+      RETURNING id
+    `);
+
+    // Get stats
+    const stats = await query(`
+      SELECT
+        COUNT(*) as total,
+        COUNT(cost) as with_cost,
+        COUNT(size) as with_size
+      FROM sku_master
+      WHERE marketplace = 'amazon'
+    `);
+
+    const result = {
+      updated: (updateResult as any).rowCount || updateResult.length || 0,
+      inserted: insertResult.length || 0,
+      total: parseInt(stats[0]?.total || '0'),
+      withCost: parseInt(stats[0]?.with_cost || '0'),
+      withSize: parseInt(stats[0]?.with_size || '0'),
+    };
+
+    console.log(`[mapping/amazon-analyzer/sync] Sync complete:`, result);
+
+    res.json({
+      success: true,
+      data: result,
+      message: `Synced ${result.updated} updated, ${result.inserted} new. Total: ${result.total} (${result.withCost} with cost)`,
+    });
+  } catch (error: any) {
+    console.error("[mapping/amazon-analyzer/sync] Error:", error);
     res.status(500).json({ success: false, error: error.message });
   }
 });

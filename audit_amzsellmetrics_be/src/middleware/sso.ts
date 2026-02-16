@@ -9,12 +9,11 @@ interface TokenPayload {
   email: string;
   name: string;
   picture?: string;
-  apps: Record<string, string>; // { appCode: roleCode }
+  apps: Record<string, string>;
   iat: number;
   exp: number;
 }
 
-// Extend Express Request type globally
 declare global {
   namespace Express {
     interface Request {
@@ -23,13 +22,12 @@ declare global {
         email: string;
         name: string;
         picture?: string;
-        role: string; // Role for this app
+        role: string;
       };
     }
   }
 }
 
-// Middleware: SSO JWT Token Verification
 export const authenticateSSO = (req: Request, res: Response, next: NextFunction) => {
   try {
     const authHeader = req.headers.authorization;
@@ -42,20 +40,16 @@ export const authenticateSSO = (req: Request, res: Response, next: NextFunction)
     }
 
     const token = authHeader.substring(7);
-
-    // Verify JWT token
     const payload = jwt.verify(token, JWT_SECRET) as TokenPayload;
 
-    // Check if user has access to this app
     const role = payload.apps[APP_CODE];
     if (!role) {
       return res.status(403).json({
         success: false,
-        error: `You do not have access to ${APP_CODE}`
+        error: 'You do not have access to ' + APP_CODE
       });
     }
 
-    // Attach user info to request
     req.ssoUser = {
       id: payload.sub,
       email: payload.email,
@@ -80,7 +74,6 @@ export const authenticateSSO = (req: Request, res: Response, next: NextFunction)
   }
 };
 
-// Middleware: Role-based authorization
 export const requireRole = (allowedRoles: string[]) => {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.ssoUser) {
@@ -93,9 +86,7 @@ export const requireRole = (allowedRoles: string[]) => {
     if (!allowedRoles.includes(req.ssoUser.role)) {
       return res.status(403).json({
         success: false,
-        error: 'Insufficient permissions',
-        requiredRole: allowedRoles,
-        yourRole: req.ssoUser.role
+        error: 'Insufficient permissions'
       });
     }
 
@@ -103,8 +94,5 @@ export const requireRole = (allowedRoles: string[]) => {
   };
 };
 
-// Middleware: Admin only
 export const requireAdmin = requireRole(['admin']);
-
-// Middleware: Editor or Admin
 export const requireEditor = requireRole(['admin', 'editor']);

@@ -433,6 +433,38 @@ router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
   try {
     const { transactions } = req.body;
 
+    // Marketplace timezone offsets (in hours from UTC)
+    // Using standard time (no DST) for simplicity
+    // Note: May be off by 1 hour during DST periods (~6 months/year)
+    const MARKETPLACE_TIMEZONES: Record<string, number> = {
+      'US': -8,   // PST (Pacific Standard Time)
+      'CA': -8,   // PST (Canada Pacific)
+      'MX': -6,   // CST (Central Standard Time)
+      'UK': 0,    // GMT (Greenwich Mean Time)
+      'DE': 1,    // CET (Central European Time)
+      'FR': 1,    // CET
+      'IT': 1,    // CET
+      'ES': 1,    // CET
+      'NL': 1,    // CET
+      'PL': 1,    // CET
+      'SE': 1,    // CET
+      'AU': 10,   // AEST (Australian Eastern Standard)
+      'AE': 4,    // GST (Gulf Standard Time)
+      'SA': 3,    // AST (Arabia Standard Time)
+      'SG': 8,    // SGT (Singapore Time)
+      'TR': 3,    // TRT (Turkey Time)
+      'BR': -3,   // BRT (Brasilia Time)
+      'JP': 9,    // JST (Japan Standard Time)
+      'IN': 5.5,  // IST (India Standard Time)
+    };
+
+    // Helper function to convert UTC date to marketplace's local date
+    function getDateOnlyInMarketplaceTimezone(utcDate: Date, marketplaceCode: string): string {
+      const offset = MARKETPLACE_TIMEZONES[marketplaceCode] || 0;
+      const localDate = new Date(utcDate.getTime() + offset * 60 * 60 * 1000);
+      return localDate.toISOString().split('T')[0];
+    }
+
     if (!transactions || !Array.isArray(transactions)) {
         // Limit array size to prevent DoS    if (transactions.length === 0) {      return res.status(400).json({ success: false, error: 'No transactions provided' });    }    if (transactions.length > 10000) {      return res.status(400).json({        success: false,        error: 'Too many transactions. Maximum 10,000 per request. Please split into multiple requests.'      });    }
       return res.status(400).json({ success: false, error: 'transactions array is required' });
@@ -456,25 +488,17 @@ router.post('/transactions/bulk', authenticateSSO, async (req, res) => {
         let paramIndex = 1;
 
         for (const t of batch) {
-          // Handle empty dateOnly
-          let dateOnly = t.dateOnly;
-          if (!dateOnly || dateOnly === '') {
-            if (t.date) {
-              const dateStr = String(t.date);
-              const match = dateStr.match(/^(\d{4}-\d{2}-\d{2})/);
-              if (match) {
-                dateOnly = match[1];
-              } else {
-                try {
-                  const d = new Date(t.date);
-                  if (!isNaN(d.getTime())) {
-                    dateOnly = d.toISOString().split('T')[0];
-                  }
-                } catch {
-                  dateOnly = null;
-                }
+          // ALWAYS calculate dateOnly from UTC timestamp using marketplace timezone
+          // Never trust the dateOnly from Excel as it doesn't account for timezone
+          let dateOnly = null;
+          if (t.date) {
+            try {
+              const d = new Date(t.date);
+              if (!isNaN(d.getTime())) {
+                // Convert UTC timestamp to marketplace's local date
+                dateOnly = getDateOnlyInMarketplaceTimezone(d, t.marketplaceCode || 'US');
               }
-            } else {
+            } catch {
               dateOnly = null;
             }
           }
