@@ -1,22 +1,8 @@
 import { Request, Response, NextFunction } from 'express';
-import jwt from 'jsonwebtoken';
+import axios from 'axios';
 
-const JWT_SECRET = process.env.SSO_JWT_SECRET;
-if (!JWT_SECRET) {
-  console.error('FATAL: SSO_JWT_SECRET environment variable is required');
-  process.exit(1);
-}
+const SSO_VERIFY_URL = process.env.SSO_VERIFY_URL || 'https://apps.iwa.web.tr/api/auth/verify';
 const APP_CODE = 'amzsellmetrics';
-
-interface TokenPayload {
-  sub: string;
-  email: string;
-  name: string;
-  picture?: string;
-  apps: Record<string, string>;
-  iat: number;
-  exp: number;
-}
 
 declare global {
   namespace Express {
@@ -32,10 +18,10 @@ declare global {
   }
 }
 
-export const authenticateSSO = (req: Request, res: Response, next: NextFunction) => {
+export const authenticateSSO = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const authHeader = req.headers.authorization;
-    
+
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
       return res.status(401).json({
         success: false,
@@ -44,9 +30,23 @@ export const authenticateSSO = (req: Request, res: Response, next: NextFunction)
     }
 
     const token = authHeader.substring(7);
-    const payload = jwt.verify(token, JWT_SECRET) as TokenPayload;
 
-    const role = payload.apps[APP_CODE];
+    // Verify token with SSO backend (no local JWT secret needed)
+    const response = await axios.post(
+      SSO_VERIFY_URL,
+      { token, app_code: APP_CODE },
+      { timeout: 5000 }
+    );
+
+    if (!response.data.success) {
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or expired token. Please login again.'
+      });
+    }
+
+    const { user, role } = response.data.data;
+
     if (!role) {
       return res.status(403).json({
         success: false,
@@ -55,25 +55,26 @@ export const authenticateSSO = (req: Request, res: Response, next: NextFunction)
     }
 
     req.ssoUser = {
-      id: payload.sub,
-      email: payload.email,
-      name: payload.name,
-      picture: payload.picture,
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      picture: user.picture,
       role: role
     };
 
     next();
   } catch (error: any) {
-    if (error.name === 'TokenExpiredError') {
-      return res.status(401).json({
+    // Handle network errors or SSO backend unavailable
+    if (error.response?.status === 403) {
+      return res.status(403).json({
         success: false,
-        error: 'Token expired. Please login again.'
+        error: 'You do not have access to ' + APP_CODE
       });
     }
-    
+
     return res.status(401).json({
       success: false,
-      error: 'Invalid token'
+      error: 'Token verification failed. Please login again.'
     });
   }
 };
